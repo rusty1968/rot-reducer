@@ -1,0 +1,11 @@
+[package]
+name = "rot_reducer"
+version = "0.1.0"
+edition = "2024"
+
+# A reusable Root-of-Trust state machine that does no I/O of its own: handlers
+# report effects into a small buffer passed in with each event, and a follow-up
+# event is just another effect (`Effect::Emit`). Two dependencies, nothing else.
+[dependencies]
+heapless = "0.9.3"
+statig = { version = "0.4.1", default-features = false }
