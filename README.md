@@ -34,38 +34,10 @@ replayable and every test an assertion over an ordered `Vec<Effect>`.
 ## An execution model for OpenPRoT
 
 This crate is an **executable model of the OpenPRoT PRoT security lifecycle** —
-the boot-time trust chain, runtime attestation, firmware update, and corruption
-recovery that a Platform Root of Trust is responsible for.
-
-**Why a model, and why executable.** The OpenPRoT specification defines that
-lifecycle around NIST SP 800-193's *protect → detect → recover* pillars, but the
-sections that would pin down the PRoT's own behaviour — **PRoT Resiliency**,
-**Firmware Recovery**, and **Secure Boot** — are still `TBD` prose. A sans-IO
-reducer turns that prose into something concrete: each requirement becomes a
-state transition, and every mandated behaviour becomes an assertion over an
-ordered `Vec`. The effect trace *is* the normative behaviour, so the
-model doubles as a runnable, testable specification rather than a document that
-can drift from any implementation.
-
-Its vocabulary maps onto the OpenPRoT service/application layers:
-
-| OpenPRoT concern | Here |
-| --- | --- |
-| Secure Boot (reads → verifies → releases) | `VerifyingPlatform` / `ReadFirmware` + `VerifyFirmware` / `ReleaseReset` |
-| Firmware Recovery + resiliency (detect → recover → lock) | `CorruptionDetected` → `Recovering` / `RestoreGoldenImage` → `Locked` |
-| Attestation (SPDM responder) | `AttestationChallenge` / `SignAttestation` |
-| Firmware Update | `Updating` / `StageUpdate` / `ActivateUpdate` |
-| Device provisioning gate | `PowerGood(PowerOnResult)` |
-
-**Faithful to real silicon, by design.** The model tracks the behaviour of a
-production PRoT (the Aspeed AST1060 firmware) rather than an idealisation:
-identity/DICE key derivation is *not* modelled here because on that hardware it
-happens one boot layer down (ROM + measuring bootloader) before this machine
-runs — so the machine starts at platform verification, and "attestation key
-available" is a power-on precondition carried in `PowerOnResult`. Likewise it
-models the trust *logic* only; the hardware choreography (reset lines, SPI/SMBus
-filters, power sequencing) lives in the board `Platform`, mirroring OpenPRoT's
-own split that scopes PRoT-hardware mechanisms out to the integrator.
+boot-time trust chain, attestation, firmware update, and corruption recovery.
+Each requirement becomes a state transition; every mandated behaviour is an
+assertion over an ordered `Vec<Effect>`. See [`docs/verification-model.md`](docs/verification-model.md)
+for the full domain mapping and why identity/DICE is out of scope.
 
 ## Layers
 
@@ -113,144 +85,52 @@ stateDiagram-v2
     Locked     --> Locked    : (terminal — all events ignored)
 ```
 
-**`Operational` superstate** (`Ready` / `Updating` / `Recovering` / `AwaitingReady`): two events are
-handled once here rather than duplicated across all four states:
+See [`docs/state-machine.md`](docs/state-machine.md) for entry actions, per-state event tables, and the `AwaitingReady` active-component gate.
 
-- `AttestationChallenge` → `SignAttestation` (handled, no transition)
-- `CorruptionDetected(id)` → `Recovering` (sets `rot.failed`)
+## Types
 
-**`VerifyingPlatform` walk**: the cursor into the chain is kept in `Rot` shared
-storage. Each `VerificationPassed` either advances the cursor (returning
-`Outcome::Handled`) or, when the last component passes, transitions to `Ready`.
-For `Active` components the machine transitions to `AwaitingReady` until
-`ComponentReady` signals the iRoT's own check passed.
-`Outcome::Handled` is used deliberately — a self-transition would reset the cursor.
+| Type | Kind | Role |
+| --- | --- | --- |
+| `ComponentId` | value | Opaque `u8` identity; the core only carries and equality-compares it. |
+| `ComponentKind` | enum | `Active` (has embedded iRoT) or `Passive` (eRoT auth only). |
+| `PowerOnResult` | enum | `Provisioned` / `Unprovisioned` / `SelfVerificationFailed` — delivered in `PowerGood`. |
+| `Event` | enum | Everything the world tells the core. |
+| `Effect` | enum | Everything the core asks the world to do; `Effect::Emit` stays internal. |
+| `State` | enum | 7 leaf states (unit variants — no per-state data). |
+| `Rot<N>` | struct | `statig` shared storage: chain, cursor, failed, retry counts. |
+| `Sink` | struct | Append-only effect buffer passed as the `statig` context. |
+| `Platform` | trait | OUT seam: `execute(&mut self, Effect)`. |
+| `EventSource` | trait | Optional IN seam for the built-in `run` loop. |
+| `Orchestrator<N>` | struct | Opaque loop handle; `dispatch_with` settles one event to completion. |
+| `run<N>` | fn | Batteries-included `-> !` loop built on `Orchestrator`. |
 
-**Recovery retry loop**: on `Restored`, if `retry_count < max_retry` the machine
-re-enters `VerifyingPlatform` to re-walk the full chain. On exhaustion, the
-`Recovering` handler emits `Effect::Emit(RecoveryFailed)`; the orchestrator
-dispatches that follow-up event before returning, driving the machine to `Locked`
-entirely within one `dispatch_with` call.
+## Design
 
-### Cold boot happy path (Passive components)
+Three mechanical choices define the purity boundary; see [`docs/structure.md`](docs/structure.md):
 
-```
-Board / shell                       rot_reducer core
-     |                                     |
-     | PowerGood(Provisioned)              |
-     |------------------------------------>| → VerifyingPlatform (entry)
-     |<-- ReadFirmware(C0) ----------------| emit
-     |<-- VerifyFirmware(C0) --------------| emit
-     |   (board reads & verifies C0)       |
-     | VerificationPassed(C0)              |
-     |------------------------------------>| Outcome::Handled, cursor → 1
-     |<-- ReleaseReset(C0) ----------------| emit
-     |<-- ReadFirmware(C1) ----------------| emit
-     |<-- VerifyFirmware(C1) --------------| emit
-     |   (board reads & verifies C1)       |
-     | VerificationPassed(C1)              |
-     |------------------------------------>| → Ready (chain done)
-     |<-- ReleaseReset(C1) ----------------| emit
-```
-
-## The types, by role
-
-### 1. Vocabulary — the data the world and core exchange
-
-| Type | Role |
-| --- | --- |
-| **`ComponentId`** | Opaque component identity (a `u8` the core never interprets). The board maps each id to real hardware; the core only ever compares and carries them. `new(u8)` / `get() -> u8`. |
-| **`ComponentKind`** | Whether a component is `Active` (has an embedded iRoT that self-verifies) or `Passive` (firmware verified solely by the eRoT). Supplied by the board per chain entry. |
-| **`PowerOnResult`** | Result of the power-on provisioning read — `Provisioned` / `Unprovisioned` / `SelfVerificationFailed`. Delivered *as event data* (see "reads as events"), never pulled by the core. |
-| **`Event`** | Everything the world can tell the core: `PowerGood(PowerOnResult)`, `VerificationPassed(id)`, `VerificationFailed(id)`, `ComponentReady(id)`, `AttestationChallenge`, `UpdateRequest`, `UpdateVerified`, `UpdateRejected`, `CorruptionDetected(id)`, `Restored(id)`, `RecoveryFailed`. |
-| **`Effect`** | Everything the core can ask the world to do: `ReadFirmware(id)`, `VerifyFirmware(id)`, `ReleaseReset(id)`, `SignAttestation`, `AuthenticateUpdate`, `StageUpdate`, `ActivateUpdate`, `DiscardStaged`, `RestoreGoldenImage(id)`, `LatchLockdown` — plus one **internal** variant, `Emit(Event)`, that never reaches hardware (see "feedback as data"). |
-
-### 2. The machine — states and shared storage
-
-| Type | Role |
-| --- | --- |
-| **`State`** | The 7 leaf states: `PowerOnReset`, `VerifyingPlatform`, `AwaitingReady`, `Ready`, `Updating`, `Recovering`, `Locked`. Unit variants — no state-local data. |
-| **`Superstate<'sub>`** | The single superstate `Operational`, shared by `Ready`/`Updating`/`Recovering`/`AwaitingReady`. Handles what's answerable in any operational state (attestation challenge, runtime-corruption watch) so those handlers aren't duplicated. |
-| **`Rot<const N: usize>`** | The `statig` shared storage: the trust `chain` of `(ComponentId, ComponentKind)` pairs (capacity `N`), the walk `cursor`, the `failed` component, `retry_count`, the `max_retry` cap, and `awaiting` (the `Active` component currently waited on, if any). Built with `Rot::new(chain, max_retry)`. Note what's *absent*: no `effects` field — effects live in the `Sink`, not here. |
-| **`Sink`** | The inert effect buffer handed to every handler as the `statig` `Context`. Its **only** capability is `emit(effect)` — it cannot read the world or do I/O. The orchestrator owns a fresh `Sink` per dispatch and drains it after `handle` returns, so nothing effectful ever lives in shared storage. This is the core sans-IO trick (see the design moves below). |
-
-`State` and `Superstate` implement `statig`'s handler traits for `Rot<N>`
-(`call_handler`, `call_entry_action`, `superstate`); those `impl` blocks *are*
-the transition logic.
-
-### 3. The seams — how the core touches the world
-
-| Type | Role |
-| --- | --- |
-| **`Platform`** | The **OUT** seam: `execute(&mut self, effect: Effect)` performs one external side effect. This is the *only* outward capability. There is deliberately no reader method — the world speaks *in* through `Event`s, not through core-initiated reads. Never called with `Effect::Emit`. |
-| **`EventSource`** | The **opt-in IN** seam: `next_event(&mut self) -> Event`. Only needed if you use the `run` loop instead of driving an `Orchestrator` yourself — a caller running its own loop never implements it. |
-
-**Why `EventSource` is opt-in (and `Platform` isn't).** There are two ways to
-drive the machine, and `EventSource` matters to only one of them:
-
-1. **You own the loop** (the normal path): hold an `Orchestrator` and push each
-   event in with `dispatch` / `dispatch_with`, sourcing events however your
-   system already does (an ISR queue, an RTOS mailbox, a scheduler). You never
-   implement `EventSource`.
-2. **The crate owns the loop** (a convenience): call `run`, and *it* loops
-   forever — which means it has to **pull** the next event from somewhere. That
-   "somewhere" is `EventSource::next_event`. It exists solely to feed `run`.
-
-The two seams are asymmetric on purpose. `Platform` (OUT) is effectively
-required because effects always have to go *somewhere* — every dispatch produces
-them. `EventSource` (IN) is optional because event delivery is a question of
-*who owns the fetch loop*: **you push** into `dispatch`, or **`run` pulls** via
-`EventSource`. On real RoT hardware, events are already produced by the platform
-(interrupts, mailboxes) and the integrator already has a loop, so `dispatch`
-(push) is the expected default and `run` + `EventSource` is just an opt-in
-shortcut for simple setups — `examples/board.rs` iterates a fixed script and
-doesn't implement `EventSource` at all.
-
-### 4. The dispatch loop — running the machine
-
-| Type | Role |
-| --- | --- |
-| **`Orchestrator<const N: usize>`** | The opaque handle a caller steps from its own loop. Wraps `StateMachine<Rot<N>>` so callers **never name a `statig` type**. Its weight is in `dispatch_with(event, on_effect)`: it dispatches one event **to completion** — buffering internal `Effect::Emit` follow-ups and re-dispatching them FIFO before returning — invoking `on_effect` once per *external* effect in emission order. `dispatch(&mut impl Platform, event)` is sugar for the `Platform` path; `state()` reports the current leaf; `new(chain, max_retry)` builds it. |
-| **`run<N>(io, chain, max_retry) -> !`** | Batteries-included loop for callers who want the crate to own the loop: pull an event via `EventSource`, dispatch it to completion via `Platform`, forever. Built on `Orchestrator`; callers who already have a loop should hold an `Orchestrator` and step it instead. |
-
-## The three design moves
-
-This crate sits one notch off the strict sans-IO end of the purity spectrum.
-Three deliberate mechanical choices define it:
-
-1. **Effects flow through an inert `Sink` in `Context`** — handlers call
-   `ctx.emit(..)`, not `rot.emit(..)`. Because the effect buffer lives in the
-   orchestrator-owned context (fresh per dispatch), there is no effect queue in shared
-   storage, and therefore no `before_dispatch` clear hook. Purity is unchanged:
-   the `Sink` can only append effects, never read or perform I/O.
-
-2. **Feedback as data (`Effect::Emit`)** — a handler can schedule a follow-up
-   event by emitting `Effect::Emit(event)`. The orchestrator intercepts it and
-   re-dispatches FIFO before returning. This is used to enforce the recovery-retry
-   cap **inside the core** (INV7): on the `max_retry`-th failed `Restored`, the
-   `Recovering` handler self-emits `RecoveryFailed` → `Locked`, with no external
-   watchdog — and the whole decision is visible in the effect trace.
-
-3. **Reads as events (no reader lane)** — the core has no synchronous read
-   capability. Where a decision needs a world read (provisioning status at
-   power-on), the shell performs it and delivers the result *in the event*:
-   `Event::PowerGood(PowerOnResult)`. The core stays a pure function of its inputs.
+1. **`Sink` as context** — effects are appended to an orchestrator-owned buffer, never stored on `Rot`.
+2. **`Effect::Emit`** — a follow-up event rides the effect trace; used for the in-core retry cap (INV7).
+3. **Reads as events** — outside information arrives inside `Event` payloads (`PowerGood(PowerOnResult)`).
 
 ## Invariants
 
-The behaviours the tests lock in. Each is referenced by id in the source and
-test comments so a failing test points directly at the requirement it broke.
+Each behaviour is cross-referenced by ID in source and test comments.
+Full statements and enforcement rationale: [`docs/invariants.md`](docs/invariants.md).
 
-| ID | Statement | Verified by |
+| ID | One-liner | Test |
 | --- | --- | --- |
-| **INV1** | A provisioned power-on always enters `VerifyingPlatform` (never `Ready` or `Locked` directly). | `cold_boot_walks_chain_in_order` |
-| **INV2** | No `ReleaseReset(id)` is ever emitted before the corresponding `VerificationPassed(id)` arrives — components are only freed once verified. | `cold_boot_walks_chain_in_order` |
-| **INV3** | Components are measured and released in chain order; no component is skipped or released out of sequence. | `cold_boot_walks_chain_in_order` |
-| **INV4** | A rejected firmware update rolls back via `DiscardStaged` and returns to `Ready`; it never triggers `Recovering` or `Locked`. | `update_rollback_is_not_recovery` |
-| **INV5** | `CorruptionDetected(id)` issues `RestoreGoldenImage(id)` for the exact named component; after `Restored` the full trust chain is re-walked from component 0. | `runtime_corruption_targets_component_and_rewalks` |
-| **INV6** | `AttestationChallenge` produces `SignAttestation` from every `Operational` state (`Ready`, `Updating`, `Recovering`, `AwaitingReady`) without a state change. | `attestation_shared_across_operational_states` |
-| **INV7** | After `max_retry` consecutive failed restores the core self-emits `RecoveryFailed` and latches to `Locked` — no external `RecoveryFailed` event is required. | `retry_cap_self_latches_via_emit` |
-| **INV8** | The core never inspects the contents of a `ComponentId`; it only carries and equality-compares the opaque value. All hardware mapping belongs to the board. | test setup comment |
+| **INV1** | Provisioned boot always enters `VerifyingPlatform`. | `cold_boot_walks_chain_in_order` |
+| **INV2** | No `ReleaseReset` before `VerificationPassed`. | `cold_boot_walks_chain_in_order` |
+| **INV3** | Chain order is respected; no skipping. | `cold_boot_walks_chain_in_order` |
+| **INV4** | Rejected update rolls back; never triggers recovery. | `update_rollback_is_not_recovery` |
+| **INV5** | Corruption targets named component; re-walks full chain after restore. | `runtime_corruption_targets_component_and_rewalks` |
+| **INV6** | `AttestationChallenge` answered from any `Operational` state. | `attestation_shared_across_operational_states` |
+| **INV7** | Retry cap enforced in-core via `Effect::Emit`; no external watchdog. | `retry_cap_self_latches_via_emit` |
+| **INV8** | Core never inspects `ComponentId` contents. | test setup |
+| **INV9** | Spurious `ComponentReady` (wrong id) is silently ignored. | `spurious_component_ready_is_ignored` |
+| **INV10** | `Active` component gates chain walk until `ComponentReady`. | `active_component_gates_on_component_ready` |
+| **INV11** | `SelfVerificationFailed` latches immediately without entering `VerifyingPlatform`. | `self_verification_failure_latches_immediately` |
+| **INV12** | `AttestationChallenge` answered in `AwaitingReady` same as all `Operational` states. | `attestation_in_awaiting_ready` |
 
 ## Usage
 
@@ -365,25 +245,12 @@ the doctest above).
 
 | Term | Meaning |
 | --- | --- |
-| **RoT** | Root of Trust — a hardware security engine that anchors platform trust. |
-| **PRoT** | Platform Root of Trust — the RoT subsystem responsible for the platform boot-time trust chain (measure, verify, release) and runtime resiliency. |
-| **PA-RoT** | Platform Active Root of Trust — OCP/Cerberus terminology for the platform-level RoT device that actively gates components (holds in reset, verifies, releases or recovers). This is the role this machine models. The core is transport-agnostic: whether the board implements measurement via SPI interposition, I3C, MCTP, or another mechanism is a board-layer choice. |
-| **SPI interposition** | A board-layer measurement technique where the RoT MCU sits physically inline between the host SoC/BMC and its SPI flash chip. Because all flash reads pass through the RoT, it can read the firmware image directly off the bus at power-on — without the host being involved — hash it, check it against the RIM, and only then release the host from reset. The RoT can also enforce write-protection on flash regions at runtime, so a compromised running host cannot persist malware. The core has no knowledge of this: from its perspective it emits `ReadFirmware(id)` + `VerifyFirmware(id)` and waits for `VerificationPassed(id)`; the board layer decides whether that happens over SPI, I3C, an MCTP channel, or any other transport. |
-| **AC-RoT** | Active Component Root of Trust — a per-peripheral RoT embedded in each component (NIC, SSD, GPU) that provides signed firmware measurements when challenged by the PA-RoT. Not modelled here; this machine represents the PA-RoT logic. |
-| **HSM** | Hardware Security Module — a tamper-resistant device that performs cryptographic operations and key management. Used loosely in the crate description to indicate the security domain; this crate models the RoT *state machine logic*, not a classical standalone HSM product. |
-| **OCP** | Open Compute Project — the industry consortium whose platform security specifications (including OpenPRoT and the Cerberus architecture) this crate models. |
-| **OpenPRoT** | The OCP PRoT security lifecycle specification: Secure Boot, attestation, firmware update, and resiliency, structured around NIST SP 800-193. |
-| **NIST SP 800-193** | *Platform Firmware Resiliency Guidelines* — defines the *protect → detect → recover* pillars that structure the state machine's lifecycle. |
-| **Chain of trust** | The ordered sequence of `ComponentId`s in `Rot.chain` that the machine walks during `VerifyingPlatform`. Each component is verified before its successor is touched; the order is a board-layer policy choice. |
-| **RIM** | Reference Integrity Manifest — the authoritative record of known-good firmware digests for each component. `VerifyFirmware(id)` asks the platform to check a freshly read image against it. The RIM is owned by the board/platform layer; the core never sees its contents. Called **PFM** (Platform Firmware Manifest) in the Cerberus/OCP vocabulary — same concept, different spec lineage. |
-| **Golden image** | The known-good firmware copy that `RestoreGoldenImage(id)` asks the board to write back to a corrupted component. Stored in protected storage managed by the board; the core never reads it. |
-| **PFM** | Platform Firmware Manifest — the Cerberus/OCP name for the signed per-component firmware policy. See **RIM** above. |
-| **DICE** | Device Identifier Composition Engine — a TCG standard for layered identity and attestation key derivation. Not modelled here; it runs one boot layer below (ROM + measuring bootloader) before this machine starts. |
-| **SPDM** | Security Protocol and Data Model (DMTF DSP0274) — the request/response protocol used for attestation challenges. `AttestationChallenge` / `SignAttestation` represent the SPDM responder path. |
-| **MCTP** | Management Component Transport Protocol — the underlying transport for SPDM and other management messages on OCP platforms. Referenced in the `pw_kernel` task analogy. |
-| **Sans-IO** | A design pattern where a core library never performs I/O itself; it only accepts inputs and returns/emits descriptions of effects. All I/O is delegated to the caller (the board/shell layer here). |
-| **Effect trace** | The ordered sequence of `Effect` values emitted during a run. Because the core is pure, this trace fully determines observable behaviour and serves as the oracle in tests. |
-| **PowerOnResult** | The power-on state read from OTP/UFM indicating whether the device has been provisioned with its identity and self-verification passed. Delivered to the core as event data (`PowerGood(PowerOnResult::Provisioned/Unprovisioned/SelfVerificationFailed)`) rather than read directly. |
-| **OTP / UFM** | One-Time Programmable fuses / User Flash Memory — non-volatile storage on the SoC where provisioning state and secrets are kept. Read by the board layer, never by the core. |
-| **ComponentId** | An opaque `u8` handle the core uses to identify a platform component (BMC firmware, host firmware, etc.) without knowing anything about it. The board maps ids to real hardware. |
-| **`statig`** | The Rust hierarchical state-machine framework (`crates.io/crates/statig`) used as the engine. Its handler traits are implemented by hand (macro-free) in `src/lib.rs`. |
+| **eRoT** | External / discrete Root of Trust — the RoT device that gates and verifies platform components. |
+| **iRoT** | Integrated Root of Trust — an RoT embedded inside a component (e.g. Caliptra in a CPU/BMC). `Active` components have one. |
+| **Sans-IO** | The core never performs I/O; it only emits `Effect` descriptions that the board layer executes. |
+| **Effect trace** | The ordered `Vec<Effect>` emitted during a run — the oracle in every test. |
+| **Chain of trust** | The ordered `Vec<(ComponentId, ComponentKind)>` in `Rot.chain` walked during `VerifyingPlatform`. |
+| **RIM / PFM** | Reference Integrity Manifest / Platform Firmware Manifest — known-good firmware digests. `VerifyFirmware(id)` asks the board to check against it; the core never sees the contents. |
+| **Golden image** | The known-good firmware copy written back by `RestoreGoldenImage(id)`. Owned by the board. |
+| **DICE** | Device Identifier Composition Engine — runs one layer below this machine (ROM + bootloader); not modelled here. |
+| **OpenPRoT** | OCP PRoT lifecycle spec (Secure Boot, attestation, update, resiliency) this crate models. |
