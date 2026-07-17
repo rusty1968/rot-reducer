@@ -29,6 +29,13 @@ them.
 This two-tier model — eRoT gate + optional iRoT gate — is the core problem the
 verification states solve.
 
+The **verification boundary** is the interface between the platform layer and the
+pure state-machine core. Only verdicts cross it: the platform performs all
+cryptographic work (reading flash, checking signatures and SVN) and then signals
+the outcome via an event. The core never sees raw firmware data or hash values —
+it only acts on the resulting `VerificationPassed` or `VerificationFailed`. This
+keeps the core free of I/O and testable without hardware.
+
 ---
 
 ## 2. Domain Types
