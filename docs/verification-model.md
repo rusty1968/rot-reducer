@@ -212,6 +212,52 @@ VerificationPassed(C1):
   chain done → Ready
 ```
 
+### Concrete example: BMC (Active) → HOST (Active) → NIC (Passive)
+
+This maps directly to the single-node boot sequence in the CSA architecture doc
+and to `examples/board.rs`.
+
+```
+chain: [(BMC, Active), (HOST, Active), (NIC, Passive)]
+
+VerifyingPlatform (entry):
+  emit ReadFirmware(BMC)
+  emit VerifyFirmware(BMC)          ← eRoT reads and checks BMC firmware from SPI flash
+
+VerificationPassed(BMC):            ← eRoT: BMC firmware signature + SVN valid
+  emit ReleaseReset(BMC)            ← eRoT releases BMC from reset; Caliptra iRoT runs
+  emit ReadFirmware(HOST)           ← speculative: eRoT starts HOST firmware check
+  emit VerifyFirmware(HOST)           while BMC's Caliptra iRoT is still booting
+  cursor = 1, awaiting = Some(BMC)
+  → AwaitingReady
+
+  (events may arrive in either order)
+
+ComponentReady(BMC):                ← BMC Caliptra iRoT done; MCTP channel up
+  awaiting = None
+  Handled (still in AwaitingReady, waiting for VerificationPassed(HOST))
+
+VerificationPassed(HOST):           ← eRoT: HOST firmware signature + SVN valid
+  emit ReleaseReset(HOST)           ← eRoT releases HOST from reset; Caliptra iRoT runs
+  emit ReadFirmware(NIC)            ← speculative: eRoT starts NIC firmware check
+  emit VerifyFirmware(NIC)            while HOST's Caliptra iRoT is still booting
+  cursor = 2
+  Handled (stay in AwaitingReady — awaiting is None, still waiting on NIC eRoT check)
+
+ComponentReady(HOST):               ← HOST Caliptra iRoT done; BIOS/UEFI executing
+  awaiting = None (already clear — no AwaitingReady re-entry for NIC)
+  Handled
+
+VerificationPassed(NIC):            ← eRoT: NIC firmware valid (Passive — no iRoT gate)
+  emit ReleaseReset(NIC)
+  chain done → Ready
+```
+
+Note that for HOST the machine stays in `AwaitingReady` after `VerificationPassed(HOST)`
+rather than transitioning — this is because NIC is `Passive` and the
+`VerificationPassed(NIC)` result may arrive before or after `ComponentReady(HOST)`.
+Both orderings are safe: `AwaitingReady` handles `VerificationPassed` directly.
+
 ---
 
 ## 6. The Platform Boundary
