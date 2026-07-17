@@ -18,7 +18,7 @@ use rot_reducer::{ComponentId, ComponentKind, Effect, Event, Orchestrator, Platf
 /// Two is enough for BMC + Host.
 const CAPACITY: usize = 2;
 
-/// How many recovery attempts are allowed before the machine locks down (INV8) —
+/// How many recovery attempts are allowed before the machine locks down (INV7) —
 /// also the board's choice, which the core takes as input.
 const MAX_RETRY: u8 = 3;
 

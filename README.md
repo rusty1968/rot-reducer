@@ -227,7 +227,7 @@ Three deliberate mechanical choices define it:
 2. **Feedback as data (`Effect::Emit`)** — a handler can schedule a follow-up
    event by emitting `Effect::Emit(event)`. The orchestrator intercepts it and
    re-dispatches FIFO before returning. This is used to enforce the recovery-retry
-   cap **inside the core** (INV8): on the `max_retry`-th failed `Restored`, the
+   cap **inside the core** (INV7): on the `max_retry`-th failed `Restored`, the
    `Recovering` handler self-emits `RecoveryFailed` → `Locked`, with no external
    watchdog — and the whole decision is visible in the effect trace.
 
@@ -249,8 +249,8 @@ test comments so a failing test points directly at the requirement it broke.
 | **INV4** | A rejected firmware update rolls back via `DiscardStaged` and returns to `Ready`; it never triggers `Recovering` or `Locked`. | `update_rollback_is_not_recovery` |
 | **INV5** | `CorruptionDetected(id)` issues `RestoreGoldenImage(id)` for the exact named component; after `Restored` the full trust chain is re-walked from component 0. | `runtime_corruption_targets_component_and_rewalks` |
 | **INV6** | `AttestationChallenge` produces `SignAttestation` from every `Operational` state (`Ready`, `Updating`, `Recovering`, `AwaitingReady`) without a state change. | `attestation_shared_across_operational_states` |
-| **INV8** | After `max_retry` consecutive failed restores the core self-emits `RecoveryFailed` and latches to `Locked` — no external `RecoveryFailed` event is required. | `retry_cap_self_latches_via_emit` |
-| **INV9** | The core never inspects the contents of a `ComponentId`; it only carries and equality-compares the opaque value. All hardware mapping belongs to the board. | test setup comment |
+| **INV7** | After `max_retry` consecutive failed restores the core self-emits `RecoveryFailed` and latches to `Locked` — no external `RecoveryFailed` event is required. | `retry_cap_self_latches_via_emit` |
+| **INV8** | The core never inspects the contents of a `ComponentId`; it only carries and equality-compares the opaque value. All hardware mapping belongs to the board. | test setup comment |
 
 ## Usage
 

@@ -1,47 +1,18 @@
 //! `rot_reducer` — a hardware Root-of-Trust state machine, driven as a pure reducer.
-//!
-//! It models the security lifecycle of an OCP-style (Open Compute Project) Root
-//! of Trust (RoT) — the hardware trust anchor that, at power-on, measures each
-//! platform component's firmware, releases a component from reset only once its
-//! measurement matches a known-good reference, and latches the platform into
-//! lockdown if trust cannot be established. It also covers runtime attestation,
-//! firmware update, and corruption recovery.
-//!
-//! The machine starts at *platform* verification, not self-verification: the
-//! RoT's own firmware integrity and its attestation (DICE alias) identity are
-//! established one boot layer down — by the immutable ROM and the measuring
-//! bootloader (e.g. mcuboot) — *before* this machine runs. So "the attestation
-//! key is available" is a power-on precondition carried in [`PowerOnResult`], not
-//! a step the machine sequences; the core neither measures itself nor derives a
-//! key.
+//! See `docs/verification-model.md` for the full domain context.
 //!
 //! The machine is a *pure function* of `(state, event, shared storage)`: it
-//! never touches hardware and never reads the world — it only chooses state
-//! transitions and *describes* side effects as [`Effect`] values that a board /
-//! shell layer carries out (see `examples/board.rs`). It is generic over an
-//! opaque [`ComponentId`], so no concrete hardware appears in the core. That
-//! firewall makes every run deterministic and every test an assertion over an
-//! ordered `Vec<Effect>`.
+//! describes side effects as [`Effect`] values rather than performing them; a
+//! board / shell layer carries them out (see `examples/board.rs`). No concrete
+//! hardware appears in the core — it is generic over an opaque [`ComponentId`].
 //!
-//! The core does no input or output of its own, so replaying the same events
-//! always produces the same run. Two small conveniences bend that rule without
-//! breaking it, and one keeps it strict. Three design choices in all:
+//! Three design choices define the boundary; see `docs/structure.md`:
 //!
-//!   1. **Effects go into a buffer passed in with the event.** A handler reports
-//!      an effect by calling `ctx.emit(..)`, not `rot.emit(..)`. That buffer (a
-//!      [`Sink`]) belongs to the orchestrator and is fresh for every event, so
-//!      the machine still can't do I/O, and there is no list of effects sitting
-//!      in the machine's own data that would need clearing between events.
-//!   2. **A follow-up event travels as an effect.** A handler can ask for one by
-//!      emitting the internal [`Effect::Emit`]; the orchestrator then dispatches
-//!      that event next. Because it rides along as an ordinary effect, it shows
-//!      up in the effect trace instead of being a hidden change. We use it to
-//!      enforce the recovery-retry limit inside the core (INV8) rather than
-//!      waiting on an outside `RecoveryFailed`.
-//!   3. **The core reads nothing; answers arrive in events.** Where a decision
-//!      needs outside information — such as whether the device is provisioned at
-//!      power-on — the shell reads it and puts the answer in the event itself
-//!      ([`Event::PowerGood`] carries [`PowerOnResult`]).
+//!   1. **Effects flow through [`Sink`]** (`ctx.emit(..)`, fresh per event).
+//!   2. **Feedback as data ([`Effect::Emit`])** — a follow-up event travels as
+//!      an effect and is visible in the trace; used for the retry cap (INV7).
+//!   3. **Reads as events** — outside information arrives in [`Event`] payloads;
+//!      the core never reads anything directly ([`Event::PowerGood`]).
 //!
 //! Engine: statig 0.4.1, with the `State`/`Superstate` traits written by hand
 //! (the derive macros are turned off).
@@ -61,7 +32,7 @@ use statig::Outcome;
 // chooses are passed in, not fixed here:
 //   * how many components the chain can hold — the `N` on [`Rot`]/[`Orchestrator`],
 //     taken from the size of the chain the board hands in; and
-//   * how many recovery attempts are allowed (INV8) — the `max_retry` argument.
+//   * how many recovery attempts are allowed (INV7) — the `max_retry` argument.
 // The board picks both (see `examples/board.rs`). The two limits just below,
 // [`EFFECT_CAP`] and [`PENDING_CAP`], are different: they follow from how the
 // machine itself works, not from the deployment, so they stay here in the core.
@@ -238,17 +209,10 @@ impl Sink {
     }
 }
 
-/// The data that lives between events. It holds everything the machine has to
-/// remember from one event to the next — most importantly the `cursor` into the
-/// trust chain. A normal state-to-itself transition would reset that, so the
-/// chain is walked by returning `Outcome::Handled` instead of transitioning.
+/// Shared storage: the data that persists between events.
+/// See `docs/state-machine.md §Shared storage` for field-by-field rationale.
 ///
-/// Notice there is no `effects` field: the effects live in the [`Sink`] instead,
-/// which is why nothing here has to be cleared before each event.
-///
-/// `N` is how many components the chain can hold — a board choice, not core
-/// logic — so the core sets no default and just takes whatever size chain the
-/// board hands in.
+/// `N` is the chain capacity — a board choice; the core sets no default.
 pub struct Rot<const N: usize> {
     /// The trust chain, in order; the board decides the order and kind at startup.
     chain: heapless::Vec<(ComponentId, ComponentKind), N>,
@@ -256,20 +220,20 @@ pub struct Rot<const N: usize> {
     cursor: u8,
     /// The component that failed and set off recovery, if any.
     failed: Option<ComponentId>,
-    /// How many recovery attempts have been made (INV8).
+    /// How many recovery attempts have been made (INV7).
     retry_count: u8,
     /// How many recovery attempts are allowed before the machine locks down
-    /// (INV8). The board sets this when it builds the machine.
+    /// (INV7). The board sets this when it builds the machine.
     max_retry: u8,
     /// The active component we are waiting on in [`State::AwaitingReady`], if
-    /// any. `None` in every other state (INV10).
+    /// any. `None` in every other state (INV9).
     awaiting: Option<ComponentId>,
 }
 
 impl<const N: usize> Rot<N> {
     /// Build the machine's data from the board's trust `chain` (each entry is a
     /// `(ComponentId, ComponentKind)` pair) and its limit on recovery attempts
-    /// (INV8). Both are board choices; the core keeps them but picks no default.
+    /// (INV7). Both are board choices; the core keeps them but picks no default.
     pub fn new(chain: heapless::Vec<(ComponentId, ComponentKind), N>, max_retry: u8) -> Self {
         Self {
             chain,
@@ -291,10 +255,6 @@ impl<const N: usize> IntoStateMachine for Rot<N> {
     fn initial() -> State {
         State::PowerOnReset
     }
-
-    // No `before_dispatch` step is needed: because effects live in the `Sink`
-    // (a fresh one per event, owned by the orchestrator), there is nothing to
-    // clear here between events.
 }
 
 
@@ -302,11 +262,8 @@ impl<const N: usize> StatigState<Rot<N>> for State {
     fn call_handler(&mut self, rot: &mut Rot<N>, event: &Event, ctx: &mut Sink) -> Outcome<State> {
         match self {
             State::PowerOnReset => match event {
-                // The shell already read provisioning and put the answer in this
-                // event; the core never reads anything itself. Self-integrity and
-                // identity were established below this machine (ROM + bootloader),
-                // so a provisioned power-on goes straight to verifying the
-                // platform components.
+                // Reads-as-events: provisioning result is in the event; the core
+                // never reads directly. Identity established by ROM + bootloader.
                 Event::PowerGood(PowerOnResult::Provisioned) => {
                     Outcome::Transition(State::VerifyingPlatform)
                 }
@@ -314,28 +271,24 @@ impl<const N: usize> StatigState<Rot<N>> for State {
                 Event::PowerGood(PowerOnResult::Unprovisioned) => {
                     Outcome::Transition(State::Locked)
                 }
-                // Self-verification failed (INV12) — latch immediately.
+                // Self-verification failed (INV11) — latch immediately.
                 Event::PowerGood(PowerOnResult::SelfVerificationFailed) => {
                     Outcome::Transition(State::Locked)
                 }
                 _ => Outcome::Super,
             },
 
-            // Walk the trust chain using `Handled` and the `cursor`, never a
-            // state-to-itself transition (that would reset the cursor).
+            // Cursor walk via Outcome::Handled — a self-transition would reset cursor.
             State::VerifyingPlatform => match event {
                 Event::VerificationPassed(id) => {
                     ctx.emit(Effect::ReleaseReset(*id));
-                    // Branch on the *current* component's kind (the one that
-                    // just passed), not the next: an Active component must have
-                    // its own iRoT confirm readiness before we advance.
+                    // Active: wait for iRoT gate; Passive: advance immediately.
                     let current_kind = rot.chain[rot.cursor as usize].1;
                     let next_idx = (rot.cursor as usize) + 1;
                     if next_idx < rot.chain.len() {
                         let (next_id, _) = rot.chain[next_idx];
                         rot.cursor += 1;
-                        // Speculatively start reading the next component while
-                        // the current one's iRoT (if Active) is still booting.
+                        // Speculative: start next while current Active iRoT boots.
                         ctx.emit(Effect::ReadFirmware(next_id));
                         ctx.emit(Effect::VerifyFirmware(next_id));
                         match current_kind {
@@ -359,27 +312,18 @@ impl<const N: usize> StatigState<Rot<N>> for State {
                 _ => Outcome::Super,
             },
 
-            // Waiting for an Active component's iRoT to confirm readiness.
-            // The cursor already points to the next component and its
-            // ReadFirmware + VerifyFirmware have already been emitted
-            // speculatively; we just need to wait here until both
-            // ComponentReady (iRoT done) and VerificationPassed (eRoT done)
-            // have arrived before moving on.
+            // Active-component gate; see docs/state-machine.md §AwaitingReady.
             State::AwaitingReady => match event {
-                // The board signals that the awaited component's iRoT finished
-                // its local verification (INV11). Clear the latch and stay here
-                // to receive the pending VerificationPassed for the next
-                // component (already speculatively read).
+                // iRoT done (INV10) — clear latch, stay for pending VerificationPassed.
                 Event::ComponentReady(id) => {
                     if rot.awaiting != Some(*id) {
-                        // Stale or spurious — ignore (INV10).
+                        // Stale or spurious — ignore (INV9).
                         return Outcome::Handled;
                     }
                     rot.awaiting = None;
                     Outcome::Handled
                 }
-                // eRoT authentication of the speculatively-read next-in-chain
-                // component completed. Release it and advance.
+                // eRoT auth on the speculatively-read next component done.
                 Event::VerificationPassed(id) => {
                     ctx.emit(Effect::ReleaseReset(*id));
                     let next_idx = (rot.cursor as usize) + 1;
@@ -403,9 +347,7 @@ impl<const N: usize> StatigState<Rot<N>> for State {
 
             State::Ready => match event {
                 Event::UpdateRequest => Outcome::Transition(State::Updating),
-                // Attestation and the corruption watch are handled by the
-                // shared Operational group state.
-                _ => Outcome::Super,
+                _ => Outcome::Super, // → Operational superstate
             },
 
             State::Updating => match event {
@@ -425,11 +367,8 @@ impl<const N: usize> StatigState<Rot<N>> for State {
                 Event::Restored(_) => {
                     rot.retry_count = rot.retry_count.saturating_add(1);
                     if rot.retry_count >= rot.max_retry {
-                        // Out of attempts: hand ourselves a `RecoveryFailed`
-                        // event, so the limit is enforced here in the core rather
-                        // than by an outside timer. The orchestrator handles it
-                        // next, sending us to Locked, and the whole thing shows
-                        // up in the effect trace.
+                        // Feedback-as-data: enforce cap in-core, visible in
+                        // trace; see docs/structure.md §Feedback as data (INV7).
                         ctx.emit(Effect::Emit(Event::RecoveryFailed));
                         Outcome::Handled
                     } else {
@@ -448,8 +387,7 @@ impl<const N: usize> StatigState<Rot<N>> for State {
 
     fn call_entry_action(&mut self, rot: &mut Rot<N>, ctx: &mut Sink) {
         match self {
-            // Start the chain walk: reset cursor and awaiting, then kick off
-            // the eRoT's authentication of the first component.
+            // Entry: reset cursor and kick off eRoT auth of the first component.
             State::VerifyingPlatform => {
                 rot.cursor = 0;
                 rot.awaiting = None;
@@ -473,9 +411,7 @@ impl<const N: usize> StatigState<Rot<N>> for State {
             State::Locked => {
                 ctx.emit(Effect::LatchLockdown);
             }
-            // Platform is fully verified and healthy: clear the per-episode
-            // recovery tally so a future corruption starts counting from zero
-            // (INV8 tracks consecutive failures, not lifetime total).
+            // Entry: clear retry tally — INV7 counts consecutive failures only.
             State::Ready => {
                 rot.retry_count = 0;
             }
@@ -498,8 +434,6 @@ impl<const N: usize> StatigState<Rot<N>> for State {
 impl<const N: usize> StatigSuperstate<Rot<N>> for Superstate<'_> {
     fn call_handler(&mut self, rot: &mut Rot<N>, event: &Event, ctx: &mut Sink) -> Outcome<State> {
         match self {
-            // These are handled the same way in every Operational state: an
-            // attestation challenge, and the watch for runtime corruption.
             Superstate::Operational(_) => match event {
                 // Answer an attestation challenge by signing it (INV6).
                 Event::AttestationChallenge => {
@@ -577,7 +511,7 @@ pub struct Orchestrator<const N: usize> {
 impl<const N: usize> Orchestrator<N> {
     /// Build an orchestrator from the board's trust `chain` (each entry is a
     /// `(ComponentId, ComponentKind)` pair) and its limit on recovery attempts
-    /// (INV8) — both board choices. The capacity `N` comes from the chain.
+    /// (INV7) — both board choices. The capacity `N` comes from the chain.
     /// Nothing runs yet: the first `dispatch*` runs the starting state's entry
     /// actions.
     pub fn new(chain: heapless::Vec<(ComponentId, ComponentKind), N>, max_retry: u8) -> Self {
@@ -650,7 +584,7 @@ mod tests {
     use super::*;
     use std::vec::Vec;
 
-    // Two generic components — the core never learns what they are (INV9).
+    // Two generic components — the core never learns what they are (INV8).
     const C0: ComponentId = ComponentId::new(0);
     const C1: ComponentId = ComponentId::new(1);
 
@@ -836,7 +770,7 @@ mod tests {
         assert_eq!(state, State::VerifyingPlatform);
     }
 
-    /// Feedback-as-data (INV8 enforced in-core): after `MAX_RETRY` restore
+    /// Feedback-as-data (INV7 enforced in-core): after `MAX_RETRY` restore
     /// attempts the core self-emits `RecoveryFailed` and latches to `Locked`
     /// WITHOUT any external `RecoveryFailed` in the script.
     #[test]
@@ -886,7 +820,7 @@ mod tests {
         assert_eq!(effects.last(), Some(&Effect::ReleaseReset(C2)));
     }
 
-    /// INV8 counts consecutive failures, not a lifetime total: after a full
+    /// INV7 counts consecutive failures, not a lifetime total: after a full
     /// recovery cycle reaches Ready the tally resets, so a later unrelated
     /// corruption starts from zero and cannot prematurely latch the machine.
     #[test]
@@ -945,9 +879,9 @@ mod tests {
         assert_eq!(effects.last(), Some(&Effect::LatchLockdown));
     }
 
-    // ----- New invariant tests (INV10–INV13) -----
+    // ----- New invariant tests (INV9–INV12) -----
 
-    /// INV12: PowerGood(SelfVerificationFailed) latches to Locked immediately
+    /// INV11: PowerGood(SelfVerificationFailed) latches to Locked immediately
     /// without ever entering VerifyingPlatform.
     #[test]
     fn self_verification_failure_latches_immediately() {
@@ -959,7 +893,7 @@ mod tests {
         assert_eq!(state, State::Locked);
     }
 
-    /// INV11: an Active component gates the chain walk — the cursor does not
+    /// INV10: an Active component gates the chain walk — the cursor does not
     /// advance and the next component's measurement does not begin until
     /// ComponentReady arrives.
     #[test]
@@ -994,7 +928,7 @@ mod tests {
         assert!(effects2.contains(&Effect::ReleaseReset(C1)));
     }
 
-    /// INV10: a ComponentReady that does not match the awaited component is
+    /// INV9: a ComponentReady that does not match the awaited component is
     /// silently ignored; the walk does not advance.
     #[test]
     fn spurious_component_ready_is_ignored() {
@@ -1012,7 +946,7 @@ mod tests {
         assert!(!effects.contains(&Effect::ReleaseReset(C1)));
     }
 
-    /// INV13: AttestationChallenge is handled in AwaitingReady exactly as in
+    /// INV12: AttestationChallenge is handled in AwaitingReady exactly as in
     /// Ready/Updating/Recovering — no state change.
     #[test]
     fn attestation_in_awaiting_ready() {

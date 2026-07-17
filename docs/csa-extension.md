@@ -240,7 +240,7 @@ defer it; either way the core emits it immediately and will receive
 
 ```
 Event::ComponentReady(id) in AwaitingReady:
-    // Confirm the id matches what we expect (INV10).
+    // Confirm the id matches what we expect (INV9).
     let expected = rot.chain[rot.cursor].0;
     if id == expected:
         if chain done:
@@ -394,14 +394,14 @@ does its own inner walk.
 
 ## 6. New invariants
 
-These join the existing INV1–INV9:
+These join the existing INV1–INV8:
 
 | ID | Statement | Verified by |
 |---|---|---|
-| **INV10** | A `ComponentReady(id)` that does not match `rot.awaiting` is silently ignored; the walk does not advance on a stale or spurious ready signal. | `spurious_component_ready_is_ignored` |
-| **INV11** | An `Active` component is never advanced past in the chain walk without a `ComponentReady(id)` arriving for it — the cursor does not move and the next component's measurement does not begin until the active component confirms readiness. | `active_component_gates_on_component_ready` |
-| **INV12** | A `PowerGood(SelfVerificationFailed)` always transitions to `Locked` with `LatchLockdown` emitted, without ever entering `VerifyingPlatform`. | `self_verification_failure_latches_immediately` |
-| **INV13** | `AttestationChallenge` is handled in `AwaitingReady` the same as in `Ready` / `Updating` / `Recovering` — without a state change. | `attestation_shared_across_operational_states` (extended) |
+| **INV9** | A `ComponentReady(id)` that does not match `rot.awaiting` is silently ignored; the walk does not advance on a stale or spurious ready signal. | `spurious_component_ready_is_ignored` |
+| **INV10** | An `Active` component is never advanced past in the chain walk without a `ComponentReady(id)` arriving for it — the cursor does not move and the next component's measurement does not begin until the active component confirms readiness. | `active_component_gates_on_component_ready` |
+| **INV11** | A `PowerGood(SelfVerificationFailed)` always transitions to `Locked` with `LatchLockdown` emitted, without ever entering `VerifyingPlatform`. | `self_verification_failure_latches_immediately` |
+| **INV12** | `AttestationChallenge` is handled in `AwaitingReady` the same as in `Ready` / `Updating` / `Recovering` — without a state change. | `attestation_shared_across_operational_states` (extended) |
 
 ---
 
@@ -442,7 +442,7 @@ behaviour is identical for all-`Passive` chains.
 - The sans-IO contract: the core still has no reader lane, no I/O, no hardware.
 - `Sink` / `Context` pattern: effects still flow through an inert per-dispatch
   buffer.
-- `Effect::Emit` / feedback-as-data for recovery retry (INV8).
+- `Effect::Emit` / feedback-as-data for recovery retry (INV7).
 - `Orchestrator` API: `dispatch`, `dispatch_with`, `state`, `new` — same
   signatures, same opaqueness over `statig`.
 - `Platform` trait: `execute(&mut self, effect: Effect)` — unchanged.
@@ -463,7 +463,7 @@ behaviour is identical for all-`Passive` chains.
    ids as `Passive`.
 3. `AwaitingReady` state + `ComponentReady` event — new state and handler,
    existing paths unchanged for all-Passive chains.
-4. New tests for INV10–INV13.
+4. New tests for INV9–INV12.
 5. Update `examples/board.rs` to annotate the two-component chain
    (`BMC → Active`, `HOST → Active`) and wire `ComponentReady` signals.
 6. Add `examples/csa_single_node.rs` with a three-component CSA chain
