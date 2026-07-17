@@ -5,6 +5,39 @@ states, shared storage, entry actions, transition table, and the single
 superstate — and how all of it is expressed through `statig`'s hand-written
 (macro-free) trait impls.
 
+```mermaid
+stateDiagram-v2
+    [*] --> PowerOnReset
+
+    PowerOnReset --> VerifyingPlatform : PowerGood(Provisioned)
+    PowerOnReset --> Locked             : PowerGood(Unprovisioned)
+    PowerOnReset --> Locked             : PowerGood(SelfVerificationFailed)
+
+    VerifyingPlatform --> VerifyingPlatform : VerificationPassed [more, Passive]\n/ ReleaseReset · ReadFirmware · VerifyFirmware
+    VerifyingPlatform --> AwaitingReady     : VerificationPassed [more, Active]\n/ ReleaseReset · ReadFirmware · VerifyFirmware
+    VerifyingPlatform --> Ready             : VerificationPassed [chain done]\n/ ReleaseReset
+    VerifyingPlatform --> Recovering        : VerificationFailed\n/ RestoreGoldenImage
+
+    AwaitingReady --> AwaitingReady : VerificationPassed [more]\n/ ReleaseReset · ReadFirmware · VerifyFirmware
+    AwaitingReady --> Ready         : ComponentReady [chain done]
+    AwaitingReady --> AwaitingReady : ComponentReady [more]
+    AwaitingReady --> Recovering    : VerificationFailed\n/ RestoreGoldenImage
+
+    state Operational {
+        [*]           --> Ready
+        Ready         --> Updating      : UpdateRequest\n/ AuthenticateUpdate · StageUpdate
+        Updating      --> Ready         : UpdateVerified / ActivateUpdate
+        Updating      --> Ready         : UpdateRejected / DiscardStaged
+        Ready         --> Recovering    : CorruptionDetected\n/ RestoreGoldenImage
+        Updating      --> Recovering    : CorruptionDetected\n/ RestoreGoldenImage
+        AwaitingReady --> Recovering    : CorruptionDetected\n/ RestoreGoldenImage
+    }
+
+    Recovering --> VerifyingPlatform : Restored [retry < max_retry]
+    Recovering --> Locked    : Restored [retry ≥ max_retry]\n(self-emits RecoveryFailed)\n/ LatchLockdown
+    Locked     --> Locked    : (terminal — all events ignored)
+```
+
 ---
 
 ## Shared storage — `Rot<N>`
