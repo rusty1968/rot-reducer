@@ -3,7 +3,7 @@
 This document describes how platform firmware verification is modelled in
 `rot_reducer`: the problem it solves, the types that carry the domain, the states
 and actions that sequence the work, and the boundaries between the pure core and
-the board layer that executes it.
+the platform layer that executes it.
 
 ---
 
@@ -35,7 +35,7 @@ verification states solve.
 
 ### `ComponentKind`
 
-Classifies a component at chain-build time. Supplied by the board; the core
+Classifies a component at chain-build time. Supplied by the platform; the core
 never derives it.
 
 ```
@@ -46,26 +46,26 @@ Passive — no integrated iRoT; only the eRoT check applies
 ### `ComponentId`
 
 An opaque `u8` the core carries and equality-compares but never interprets. The
-board decides which id maps to which physical device. The core never looks
+platform decides which id maps to which physical device. The core never looks
 inside.
 
 ### Events that cross the verification boundary
 
 | Event | Direction | Meaning |
 |---|---|---|
-| `VerificationPassed(ComponentId)` | board → core | The eRoT-side check passed: signature and SVN valid. |
-| `VerificationFailed(ComponentId)` | board → core | The eRoT-side check failed: image rejected. |
-| `ComponentReady(ComponentId)` | board → core | An `Active` component's integrated iRoT has finished its local verification and the component is operational (e.g. MCTP channel established). |
+| `VerificationPassed(ComponentId)` | platform → core | The eRoT-side check passed: signature and SVN valid. |
+| `VerificationFailed(ComponentId)` | platform → core | The eRoT-side check failed: image rejected. |
+| `ComponentReady(ComponentId)` | platform → core | An `Active` component's integrated iRoT has finished its local verification and the component is operational (e.g. MCTP channel established). |
 
 ### Effects the core emits for verification work
 
 | Effect | Meaning |
 |---|---|
-| `ReadFirmware(ComponentId)` | Ask the board to read the component's firmware image from eRoT-controlled flash. |
-| `VerifyFirmware(ComponentId)` | Ask the board to verify the image against the RIM/PFM. The board responds with `VerificationPassed` or `VerificationFailed`. |
+| `ReadFirmware(ComponentId)` | Ask the platform to read the component's firmware image from eRoT-controlled flash. |
+| `VerifyFirmware(ComponentId)` | Ask the platform to verify the image against the RIM/PFM. The platform responds with `VerificationPassed` or `VerificationFailed`. |
 | `ReleaseReset(ComponentId)` | Release the named component from reset. Emitted only after `VerificationPassed`. |
 
-These are descriptions, not actions. The board's `Platform::execute` carries
+These are descriptions, not actions. The platform's `Platform::execute` carries
 them out; the core never touches hardware.
 
 ---
@@ -207,14 +207,14 @@ VerificationPassed(C1):
 
 ---
 
-## 6. The Board Boundary
+## 6. The Platform Boundary
 
 The core never reads flash, never checks signatures, never observes reset lines.
 It only emits descriptions. The complete split:
 
-| Responsibility | Core (`src/lib.rs`) | Board (`Platform` impl) |
+| Responsibility | Core (`src/lib.rs`) | Platform (`Platform` impl) |
 |---|---|---|
-| Chain order and `ComponentKind` | reads from `Rot.chain`, set by board at startup | decides and provides |
+| Chain order and `ComponentKind` | reads from `Rot.chain`, set by platform at startup | decides and provides |
 | Read firmware image | emits `ReadFirmware(id)` | executes: eRoT reads via SPI interposition, I3C, or other transport |
 | Verify signature / SVN | emits `VerifyFirmware(id)` | executes: eRoT checks against RIM/PFM; responds with `VerificationPassed` or `VerificationFailed` |
 | Release from reset | emits `ReleaseReset(id)` | executes: eRoT drives reset GPIO or equivalent |

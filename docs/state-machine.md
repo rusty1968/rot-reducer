@@ -49,11 +49,11 @@ variants and carry no data; anything that must survive a transition lives here.
 
 | Field | Type | Purpose |
 |---|---|---|
-| `chain` | `Vec<(ComponentId, ComponentKind), N>` | Ordered trust chain, supplied by the board at construction time. Never mutated after build. |
+| `chain` | `Vec<(ComponentId, ComponentKind), N>` | Ordered trust chain, supplied by the platform at construction time. Never mutated after build. |
 | `cursor` | `u8` | Index of the component currently under verification. Reset to 0 on every `VerifyingPlatform` entry. Advances on each `VerificationPassed` (via `Outcome::Handled` rather than a self-transition, to avoid triggering re-entry). |
 | `failed` | `Option<ComponentId>` | The component that triggered the current recovery episode; `None` while healthy. Set on `VerificationFailed` or `CorruptionDetected`; drives the `RestoreGoldenImage` emission in `Recovering`'s entry action. |
 | `retry_count` | `u8` | Number of consecutive failed restore attempts in the current episode. Cleared to 0 in `Ready`'s entry action — consecutive only (INV7). |
-| `max_retry` | `u8` | Board-chosen ceiling for `retry_count`. When `retry_count >= max_retry` the machine self-emits `RecoveryFailed` instead of transitioning back to `VerifyingPlatform`. |
+| `max_retry` | `u8` | Platform-chosen ceiling for `retry_count`. When `retry_count >= max_retry` the machine self-emits `RecoveryFailed` instead of transitioning back to `VerifyingPlatform`. |
 | `awaiting` | `Option<ComponentId>` | The `Active` component whose iRoT readiness is currently outstanding. `Some` only while in `AwaitingReady`; `None` everywhere else (INV9). |
 
 The effect buffer is deliberately **absent** from `Rot`. Effects flow through the
@@ -218,7 +218,7 @@ The terminal state. All events fall through to `Outcome::Super`; the top-level
 handler returns `Outcome::Super` which `statig` silently discards. No further
 transitions are possible.
 
-**Entry action**: emit `LatchLockdown` — a single instruction to the board to
+**Entry action**: emit `LatchLockdown` — a single instruction to the platform to
 hold all components in reset permanently.
 
 **Events handled**: none (every event reaches the implicit top level and is
@@ -267,4 +267,4 @@ The machine uses `statig` 0.4.1 with hand-written trait impls — no proc-macros
 This means the machine always starts in `PowerOnReset` — there is no way to
 branch on a runtime value at construction time. The shell-supplied
 `PowerGood(PowerOnResult)` event is the first real branching point (see
-`verification-model.md` §Board boundary for the rationale).
+`verification-model.md` §Platform boundary for the rationale).

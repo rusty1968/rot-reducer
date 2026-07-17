@@ -33,7 +33,7 @@ eRoT has authenticated their firmware.
 
 ### INV3 — Chain order is respected
 
-Components are verified and released in the order the board supplied in the
+Components are verified and released in the order the platform supplied in the
 chain. No component is skipped, verified out of order, or released before its
 predecessor.
 
@@ -100,7 +100,7 @@ previous episode.
 
 `ComponentId` is an opaque `u8`. The core only carries and equality-compares it.
 All hardware mapping — which id corresponds to which physical device — belongs
-entirely to the board layer. The core cannot distinguish components by anything
+entirely to the platform layer. The core cannot distinguish components by anything
 other than identity equality.
 
 **Verified by**: test setup (both tests use only generic `C0`/`C1` with no

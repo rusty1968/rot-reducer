@@ -18,7 +18,7 @@ executes it. The two roles never mix.
                    │ Effect values
                    ▼
 ┌─────────────────────────────────────┐
-│  Interpreter (board / shell layer)  │
+│  Interpreter (platform / shell layer)  │
 │                                     │
 │  Platform::execute(effect)          │
 │                                     │
@@ -53,7 +53,7 @@ A handler builds the program by calling `ctx.emit(effect)` for each step. The
 
 ### The interpreter: `Platform`
 
-`Platform` is a single-method trait the board layer implements:
+`Platform` is a single-method trait the platform layer implements:
 
 ```rust
 pub trait Platform {
@@ -62,7 +62,7 @@ pub trait Platform {
 ```
 
 The `Orchestrator` drains the `Sink` after each event and calls
-`platform.execute(effect)` once per external effect. The board decides how each
+`platform.execute(effect)` once per external effect. The platform decides how each
 variant maps to real hardware — SPI interposition, GPIO, a crypto accelerator
 call, an IPC channel — and the core has no knowledge of any of it.
 
@@ -116,7 +116,7 @@ lives entirely outside this crate.
 
 **Separation of policy and mechanism.** The core decides *what* to do (the
 policy: verify before releasing, re-walk after recovery, latch on exhaustion).
-The board decides *how* to do it (the mechanism: SPI interposition or I3C,
+The platform decides *how* to do it (the mechanism: SPI interposition or I3C,
 GPIO or reset controller IPC, in-process or cross-process). Neither knows
 anything about the other.
 
