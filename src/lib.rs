@@ -11,7 +11,7 @@
 //! RoT's own firmware integrity and its attestation (DICE alias) identity are
 //! established one boot layer down — by the immutable ROM and the measuring
 //! bootloader (e.g. mcuboot) — *before* this machine runs. So "the attestation
-//! key is available" is a power-on precondition carried in [`Provisioning`], not
+//! key is available" is a power-on precondition carried in [`PowerOnResult`], not
 //! a step the machine sequences; the core neither measures itself nor derives a
 //! key.
 //!
@@ -41,7 +41,7 @@
 //!   3. **The core reads nothing; answers arrive in events.** Where a decision
 //!      needs outside information — such as whether the device is provisioned at
 //!      power-on — the shell reads it and puts the answer in the event itself
-//!      ([`Event::PowerGood`] carries [`Provisioning`]).
+//!      ([`Event::PowerGood`] carries [`PowerOnResult`]).
 //!
 //! Engine: statig 0.4.1, with the `State`/`Superstate` traits written by hand
 //! (the derive macros are turned off).
@@ -67,7 +67,7 @@ use statig::Outcome;
 // machine itself works, not from the deployment, so they stay here in the core.
 
 /// How many effects one event can produce. The busiest handler emits 3
-/// (`ReleaseReset` + `MeasurePlatformFirmware` + `CompareToRim`), so 8 leaves
+/// (`ReleaseReset` + `ReadFirmware` + `VerifyFirmware`), so 8 leaves
 /// plenty of room. Going over is a bug in our logic; we drop the extra rather
 /// than panic, so the core never panics and stays `no_std`.
 const EFFECT_CAP: usize = 8;
@@ -95,29 +95,55 @@ impl ComponentId {
     }
 }
 
-/// Whether the device has been provisioned, checked at power-on. The shell reads
-/// this (from OTP/UFM fuses on real hardware) and delivers the answer inside the
-/// `PowerGood` event, so the core never reads it directly.
+/// How components in the trust chain are classified. The board supplies one
+/// [`ComponentKind`] per [`ComponentId`] when building the chain.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Provisioning {
-    /// The device holds valid secrets/policy — and the lower boot layers (ROM +
-    /// bootloader) have already established its identity and attestation key — so
-    /// it can act as a root of trust.
+pub enum ComponentKind {
+    /// The component has an integrated iRoT (e.g. Caliptra). Two independent
+    /// authentication checks apply:
+    ///   1. The eRoT reads the component's firmware from the flash it controls,
+    ///      verifies signature and SVN via [`Effect::ReadFirmware`] /
+    ///      [`Effect::VerifyFirmware`], and only then emits `ReleaseReset`.
+    ///   2. After reset, the iRoT performs its own local verification. The
+    ///      machine waits in [`State::AwaitingReady`] until the board signals
+    ///      [`Event::ComponentReady`] before advancing the chain walk.
+    Active,
+    /// No local iRoT. The eRoT's authentication from flash is the only trust
+    /// gate. The chain walk advances immediately after `ReleaseReset`.
+    Passive,
+}
+
+/// The result of the board's power-on checks, delivered inside
+/// [`Event::PowerGood`]. The shell reads OTP/UFM and performs the ROM-based
+/// self-integrity check before emitting this; the core never reads anything
+/// directly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PowerOnResult {
+    /// Self-verified and provisioned. The lower boot layers (ROM + bootloader)
+    /// have established the device's identity and attestation key.
     Provisioned,
-    /// Nothing provisioned — the device cannot establish a root of trust.
+    /// Self-verified but not provisioned — the device cannot act as a RoT.
     Unprovisioned,
+    /// Self-verification failed. The machine latches to [`State::Locked`]
+    /// immediately. Any A/B recovery attempt should happen in the board layer
+    /// *before* emitting this event.
+    SelfVerificationFailed,
 }
 
 /// Everything the outside world can tell the state machine.
 ///
-/// `PowerGood` carries the [`Provisioning`] answer; the component-specific
-/// events carry the [`ComponentId`] they are about; the rest carry nothing.
+/// `PowerGood` carries the [`PowerOnResult`]; the component-specific events
+/// carry the [`ComponentId`] they are about; the rest carry nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Event {
-    /// Power-on, carrying the shell's provisioning read.
-    PowerGood(Provisioning),
-    PlatformMeasured(ComponentId),
-    PlatformMismatch(ComponentId),
+    /// Power-on, carrying the shell's self-verification and provisioning read.
+    PowerGood(PowerOnResult),
+    VerificationPassed(ComponentId),
+    VerificationFailed(ComponentId),
+    /// An [`ComponentKind::Active`] component has finished its local iRoT
+    /// verification and is ready (e.g. MCTP channel established). The board
+    /// delivers this after observing the component become operational.
+    ComponentReady(ComponentId),
     AttestationChallenge,
     UpdateRequest,
     UpdateVerified,
@@ -137,8 +163,13 @@ pub enum Event {
 /// the effect trace like everything else, instead of being a hidden change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Effect {
-    MeasurePlatformFirmware(ComponentId),
-    CompareToRim(ComponentId),
+    /// Ask the board to read the named component's firmware image from the
+    /// flash the eRoT controls (SPI interposition or equivalent).
+    ReadFirmware(ComponentId),
+    /// Ask the board to verify the measured image: check signature and SVN
+    /// against policy. The board responds with [`Event::VerificationPassed`] on
+    /// acceptance or [`Event::VerificationFailed`] on rejection.
+    VerifyFirmware(ComponentId),
     ReleaseReset(ComponentId),
     SignAttestation,
     AuthenticateUpdate,
@@ -152,11 +183,15 @@ pub enum Effect {
     Emit(Event),
 }
 
-/// The six states the machine can be in. None of them carry any data.
+/// The states the machine can be in. None of them carry any data.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum State {
     PowerOnReset,
-    MeasuringPlatform,
+    VerifyingPlatform,
+    /// The eRoT has released an [`ComponentKind::Active`] component from reset
+    /// and is waiting for that component's iRoT to finish its independent local
+    /// verification and signal [`Event::ComponentReady`].
+    AwaitingReady,
     Ready,
     Updating,
     Recovering,
@@ -215,8 +250,8 @@ impl Sink {
 /// logic — so the core sets no default and just takes whatever size chain the
 /// board hands in.
 pub struct Rot<const N: usize> {
-    /// The trust chain, in order; the board decides the order at startup.
-    chain: heapless::Vec<ComponentId, N>,
+    /// The trust chain, in order; the board decides the order and kind at startup.
+    chain: heapless::Vec<(ComponentId, ComponentKind), N>,
     /// Where we are in `chain`. Kept here so it survives across events.
     cursor: u8,
     /// The component that failed and set off recovery, if any.
@@ -226,19 +261,23 @@ pub struct Rot<const N: usize> {
     /// How many recovery attempts are allowed before the machine locks down
     /// (INV8). The board sets this when it builds the machine.
     max_retry: u8,
+    /// The active component we are waiting on in [`State::AwaitingReady`], if
+    /// any. `None` in every other state (INV10).
+    awaiting: Option<ComponentId>,
 }
 
 impl<const N: usize> Rot<N> {
-    /// Build the machine's data from the board's trust `chain` and its limit on
-    /// recovery attempts (INV8). Both are board choices; the core keeps them but
-    /// picks no default for either.
-    pub fn new(chain: heapless::Vec<ComponentId, N>, max_retry: u8) -> Self {
+    /// Build the machine's data from the board's trust `chain` (each entry is a
+    /// `(ComponentId, ComponentKind)` pair) and its limit on recovery attempts
+    /// (INV8). Both are board choices; the core keeps them but picks no default.
+    pub fn new(chain: heapless::Vec<(ComponentId, ComponentKind), N>, max_retry: u8) -> Self {
         Self {
             chain,
             cursor: 0,
             failed: None,
             retry_count: 0,
             max_retry,
+            awaiting: None,
         }
     }
 }
@@ -258,6 +297,7 @@ impl<const N: usize> IntoStateMachine for Rot<N> {
     // clear here between events.
 }
 
+
 impl<const N: usize> StatigState<Rot<N>> for State {
     fn call_handler(&mut self, rot: &mut Rot<N>, event: &Event, ctx: &mut Sink) -> Outcome<State> {
         match self {
@@ -267,11 +307,15 @@ impl<const N: usize> StatigState<Rot<N>> for State {
                 // identity were established below this machine (ROM + bootloader),
                 // so a provisioned power-on goes straight to verifying the
                 // platform components.
-                Event::PowerGood(Provisioning::Provisioned) => {
-                    Outcome::Transition(State::MeasuringPlatform)
+                Event::PowerGood(PowerOnResult::Provisioned) => {
+                    Outcome::Transition(State::VerifyingPlatform)
                 }
-                // Not provisioned, so it can't be a root of trust — lock down.
-                Event::PowerGood(Provisioning::Unprovisioned) => {
+                // Not provisioned — cannot act as a root of trust.
+                Event::PowerGood(PowerOnResult::Unprovisioned) => {
+                    Outcome::Transition(State::Locked)
+                }
+                // Self-verification failed (INV12) — latch immediately.
+                Event::PowerGood(PowerOnResult::SelfVerificationFailed) => {
                     Outcome::Transition(State::Locked)
                 }
                 _ => Outcome::Super,
@@ -279,24 +323,79 @@ impl<const N: usize> StatigState<Rot<N>> for State {
 
             // Walk the trust chain using `Handled` and the `cursor`, never a
             // state-to-itself transition (that would reset the cursor).
-            State::MeasuringPlatform => match event {
-                Event::PlatformMeasured(id) => {
-                    // Let the component we just checked out of reset (id is on the event).
+            State::VerifyingPlatform => match event {
+                Event::VerificationPassed(id) => {
                     ctx.emit(Effect::ReleaseReset(*id));
-                    if (rot.cursor as usize) + 1 < rot.chain.len() {
-                        // More components left: move to the next one and measure it.
+                    // Branch on the *current* component's kind (the one that
+                    // just passed), not the next: an Active component must have
+                    // its own iRoT confirm readiness before we advance.
+                    let current_kind = rot.chain[rot.cursor as usize].1;
+                    let next_idx = (rot.cursor as usize) + 1;
+                    if next_idx < rot.chain.len() {
+                        let (next_id, _) = rot.chain[next_idx];
                         rot.cursor += 1;
-                        let next = rot.chain[rot.cursor as usize];
-                        ctx.emit(Effect::MeasurePlatformFirmware(next));
-                        ctx.emit(Effect::CompareToRim(next));
-                        Outcome::Handled
+                        // Speculatively start reading the next component while
+                        // the current one's iRoT (if Active) is still booting.
+                        ctx.emit(Effect::ReadFirmware(next_id));
+                        ctx.emit(Effect::VerifyFirmware(next_id));
+                        match current_kind {
+                            // Active: wait for this component's iRoT before
+                            // acting on the next verification result.
+                            ComponentKind::Active => {
+                                rot.awaiting = Some(*id);
+                                Outcome::Transition(State::AwaitingReady)
+                            }
+                            // Passive: eRoT auth is the only gate — advance.
+                            ComponentKind::Passive => Outcome::Handled,
+                        }
                     } else {
-                        // Whole chain checked — the platform is ready.
                         Outcome::Transition(State::Ready)
                     }
                 }
-                Event::PlatformMismatch(id) => {
+                Event::VerificationFailed(id) => {
                     rot.failed = Some(*id);
+                    Outcome::Transition(State::Recovering)
+                }
+                _ => Outcome::Super,
+            },
+
+            // Waiting for an Active component's iRoT to confirm readiness.
+            // The cursor already points to the next component and its
+            // ReadFirmware + VerifyFirmware have already been emitted
+            // speculatively; we just need to wait here until both
+            // ComponentReady (iRoT done) and VerificationPassed (eRoT done)
+            // have arrived before moving on.
+            State::AwaitingReady => match event {
+                // The board signals that the awaited component's iRoT finished
+                // its local verification (INV11). Clear the latch and stay here
+                // to receive the pending VerificationPassed for the next
+                // component (already speculatively read).
+                Event::ComponentReady(id) => {
+                    if rot.awaiting != Some(*id) {
+                        // Stale or spurious — ignore (INV10).
+                        return Outcome::Handled;
+                    }
+                    rot.awaiting = None;
+                    Outcome::Handled
+                }
+                // eRoT authentication of the speculatively-read next-in-chain
+                // component completed. Release it and advance.
+                Event::VerificationPassed(id) => {
+                    ctx.emit(Effect::ReleaseReset(*id));
+                    let next_idx = (rot.cursor as usize) + 1;
+                    if next_idx < rot.chain.len() {
+                        let (next_id, _) = rot.chain[next_idx];
+                        rot.cursor += 1;
+                        ctx.emit(Effect::ReadFirmware(next_id));
+                        ctx.emit(Effect::VerifyFirmware(next_id));
+                        Outcome::Handled
+                    } else {
+                        Outcome::Transition(State::Ready)
+                    }
+                }
+                Event::VerificationFailed(id) => {
+                    rot.failed = Some(*id);
+                    rot.awaiting = None;
                     Outcome::Transition(State::Recovering)
                 }
                 _ => Outcome::Super,
@@ -335,7 +434,7 @@ impl<const N: usize> StatigState<Rot<N>> for State {
                         Outcome::Handled
                     } else {
                         // Start the chain over from the top to re-check trust.
-                        Outcome::Transition(State::MeasuringPlatform)
+                        Outcome::Transition(State::VerifyingPlatform)
                     }
                 }
                 Event::RecoveryFailed => Outcome::Transition(State::Locked),
@@ -349,13 +448,14 @@ impl<const N: usize> StatigState<Rot<N>> for State {
 
     fn call_entry_action(&mut self, rot: &mut Rot<N>, ctx: &mut Sink) {
         match self {
-            // Start the chain walk: reset the cursor, then measure and check the
-            // first component against its reference measurement.
-            State::MeasuringPlatform => {
+            // Start the chain walk: reset cursor and awaiting, then kick off
+            // the eRoT's authentication of the first component.
+            State::VerifyingPlatform => {
                 rot.cursor = 0;
-                if let Some(&first) = rot.chain.first() {
-                    ctx.emit(Effect::MeasurePlatformFirmware(first));
-                    ctx.emit(Effect::CompareToRim(first));
+                rot.awaiting = None;
+                if let Some(&(first_id, _)) = rot.chain.first() {
+                    ctx.emit(Effect::ReadFirmware(first_id));
+                    ctx.emit(Effect::VerifyFirmware(first_id));
                 }
             }
             // Check the update is genuine, then stage it in the spare firmware bank.
@@ -373,6 +473,12 @@ impl<const N: usize> StatigState<Rot<N>> for State {
             State::Locked => {
                 ctx.emit(Effect::LatchLockdown);
             }
+            // Platform is fully verified and healthy: clear the per-episode
+            // recovery tally so a future corruption starts counting from zero
+            // (INV8 tracks consecutive failures, not lifetime total).
+            State::Ready => {
+                rot.retry_count = 0;
+            }
             _ => {}
         }
     }
@@ -381,7 +487,7 @@ impl<const N: usize> StatigState<Rot<N>> for State {
 
     fn superstate(&mut self) -> Option<Superstate<'_>> {
         match self {
-            State::Ready | State::Updating | State::Recovering => {
+            State::Ready | State::Updating | State::Recovering | State::AwaitingReady => {
                 Some(Superstate::Operational(PhantomData))
             }
             _ => None,
@@ -413,7 +519,7 @@ impl<const N: usize> StatigSuperstate<Rot<N>> for Superstate<'_> {
 
 /// How the core reaches the outside world: carry out one effect. This is the
 /// only outward connection — the world talks back to the core only through
-/// [`Event`]s (see [`Provisioning`]), so there is no read method here, and no
+/// [`Event`]s (see [`PowerOnResult`]), so there is no read method here, and no
 /// way to fetch events either (a loop outside the core delivers those, see
 /// [`Orchestrator`]). Never called with [`Effect::Emit`].
 pub trait Platform {
@@ -437,25 +543,25 @@ pub trait EventSource {
 /// `examples/board.rs`); the core works only with the opaque ids:
 ///
 /// ```
-/// use rot_reducer::{ComponentId, Orchestrator, Event, Provisioning, State};
+/// use rot_reducer::{ComponentId, ComponentKind, Orchestrator, Event, PowerOnResult, State};
 ///
-/// // The board layer's job: pick the capacity, name components, order the
-/// // chain, and choose the recovery-retry cap. None of these live in the core.
+/// // The board layer's job: pick the capacity, name components, annotate kinds,
+/// // order the chain, and choose the recovery-retry cap.
 /// const CAPACITY: usize = 8;
 /// const MAX_RETRY: u8 = 3;
 /// const BMC: ComponentId = ComponentId::new(0);
 /// const HOST: ComponentId = ComponentId::new(1);
-/// let mut chain = heapless::Vec::<ComponentId, CAPACITY>::new();
-/// let _ = chain.push(BMC);
-/// let _ = chain.push(HOST);
+/// let mut chain = heapless::Vec::<(ComponentId, ComponentKind), CAPACITY>::new();
+/// let _ = chain.push((BMC, ComponentKind::Passive));
+/// let _ = chain.push((HOST, ComponentKind::Passive));
 ///
 /// let mut orch = Orchestrator::new(chain, MAX_RETRY);
 /// let mut effects = Vec::new();
 ///
 /// for ev in [
-///     Event::PowerGood(Provisioning::Provisioned),
-///     Event::PlatformMeasured(BMC),
-///     Event::PlatformMeasured(HOST),
+///     Event::PowerGood(PowerOnResult::Provisioned),
+///     Event::VerificationPassed(BMC),
+///     Event::VerificationPassed(HOST),
 /// ] {
 ///     // one step of the caller's loop
 ///     orch.dispatch_with(ev, |e| effects.push(e));
@@ -469,11 +575,12 @@ pub struct Orchestrator<const N: usize> {
 }
 
 impl<const N: usize> Orchestrator<N> {
-    /// Build an orchestrator from the board's trust `chain` and its limit on
-    /// recovery attempts (INV8) — both board choices. The capacity `N` comes
-    /// from the chain (a bigger board just hands in a bigger chain). Nothing runs
-    /// yet: the first `dispatch*` runs the starting state's entry actions.
-    pub fn new(chain: heapless::Vec<ComponentId, N>, max_retry: u8) -> Self {
+    /// Build an orchestrator from the board's trust `chain` (each entry is a
+    /// `(ComponentId, ComponentKind)` pair) and its limit on recovery attempts
+    /// (INV8) — both board choices. The capacity `N` comes from the chain.
+    /// Nothing runs yet: the first `dispatch*` runs the starting state's entry
+    /// actions.
+    pub fn new(chain: heapless::Vec<(ComponentId, ComponentKind), N>, max_retry: u8) -> Self {
         Self {
             machine: Rot::new(chain, max_retry).state_machine(),
         }
@@ -526,7 +633,7 @@ impl<const N: usize> Orchestrator<N> {
 /// loop, hold an [`Orchestrator`] and step it yourself instead.
 pub fn run<const N: usize>(
     io: &mut (impl Platform + EventSource),
-    chain: heapless::Vec<ComponentId, N>,
+    chain: heapless::Vec<(ComponentId, ComponentKind), N>,
     max_retry: u8,
 ) -> ! {
     let mut orch = Orchestrator::new(chain, max_retry);
@@ -548,19 +655,23 @@ mod tests {
     const C1: ComponentId = ComponentId::new(1);
 
     // Provisioned power-on — the common case for every trust-walk test.
-    const BOOT: Event = Event::PowerGood(Provisioning::Provisioned);
+    const BOOT: Event = Event::PowerGood(PowerOnResult::Provisioned);
 
     // Deployment policy the board owns — the core defines neither. Tests stand in
     // for the board and pick their own values.
     const CAPACITY: usize = 8;
     const MAX_RETRY: u8 = 3;
 
-    fn chain(ids: &[ComponentId]) -> heapless::Vec<ComponentId, CAPACITY> {
+    fn chain(ids: &[(ComponentId, ComponentKind)]) -> heapless::Vec<(ComponentId, ComponentKind), CAPACITY> {
         let mut c = heapless::Vec::new();
-        for &id in ids {
-            c.push(id).expect("chain within CAPACITY");
+        for &entry in ids {
+            c.push(entry).expect("chain within CAPACITY");
         }
         c
+    }
+
+    fn passive(ids: &[ComponentId]) -> heapless::Vec<(ComponentId, ComponentKind), CAPACITY> {
+        chain(&ids.iter().map(|&id| (id, ComponentKind::Passive)).collect::<std::vec::Vec<_>>())
     }
 
     /// A `Platform` that records every external `execute()` in order — exercises
@@ -588,7 +699,7 @@ mod tests {
     /// how a caller would), one event per step. Returns the ordered *external*
     /// effects and the final state.
     fn drive(
-        chain: heapless::Vec<ComponentId, CAPACITY>,
+        chain: heapless::Vec<(ComponentId, ComponentKind), CAPACITY>,
         script: &[Event],
     ) -> (Vec<Effect>, State) {
         let mut orch = Orchestrator::new(chain, MAX_RETRY);
@@ -599,28 +710,28 @@ mod tests {
         (platform.recorded, orch.state())
     }
 
-    /// INV1/INV2/INV3: a provisioned power-on begins platform measurement; no
-    /// component is released before its own measurement matches RIM; components
-    /// are released in chain (trust) order.
+    /// INV1/INV2/INV3: a provisioned power-on enters VerifyingPlatform; no
+    /// component is released before its eRoT-side verification passes; components
+    /// are verified and released in chain (trust) order.
     #[test]
     fn cold_boot_walks_chain_in_order() {
         let (effects, state) = drive(
-            chain(&[C0, C1]),
+            passive(&[C0, C1]),
             &[
                 BOOT,
-                Event::PlatformMeasured(C0),
-                Event::PlatformMeasured(C1),
+                Event::VerificationPassed(C0),
+                Event::VerificationPassed(C1),
             ],
         );
 
         assert_eq!(
             effects,
             std::vec![
-                Effect::MeasurePlatformFirmware(C0),
-                Effect::CompareToRim(C0),
+                Effect::ReadFirmware(C0),
+                Effect::VerifyFirmware(C0),
                 Effect::ReleaseReset(C0),
-                Effect::MeasurePlatformFirmware(C1),
-                Effect::CompareToRim(C1),
+                Effect::ReadFirmware(C1),
+                Effect::VerifyFirmware(C1),
                 Effect::ReleaseReset(C1),
             ],
         );
@@ -632,8 +743,8 @@ mod tests {
     #[test]
     fn unprovisioned_boot_locks_down() {
         let (effects, state) = drive(
-            chain(&[C0]),
-            &[Event::PowerGood(Provisioning::Unprovisioned)],
+            passive(&[C0]),
+            &[Event::PowerGood(PowerOnResult::Unprovisioned)],
         );
 
         assert_eq!(effects, std::vec![Effect::LatchLockdown]);
@@ -646,18 +757,18 @@ mod tests {
     fn attestation_shared_across_operational_states() {
         // From Ready.
         let (effects, state) = drive(
-            chain(&[C0]),
-            &[BOOT, Event::PlatformMeasured(C0), Event::AttestationChallenge],
+            passive(&[C0]),
+            &[BOOT, Event::VerificationPassed(C0), Event::AttestationChallenge],
         );
         assert_eq!(effects.last(), Some(&Effect::SignAttestation));
         assert_eq!(state, State::Ready);
 
         // From Updating.
         let (effects, state) = drive(
-            chain(&[C0]),
+            passive(&[C0]),
             &[
                 BOOT,
-                Event::PlatformMeasured(C0),
+                Event::VerificationPassed(C0),
                 Event::UpdateRequest,
                 Event::AttestationChallenge,
             ],
@@ -671,10 +782,10 @@ mod tests {
     #[test]
     fn update_rollback_is_not_recovery() {
         let (effects, state) = drive(
-            chain(&[C0]),
+            passive(&[C0]),
             &[
                 BOOT,
-                Event::PlatformMeasured(C0),
+                Event::VerificationPassed(C0),
                 Event::UpdateRequest,
                 Event::UpdateRejected,
             ],
@@ -695,24 +806,24 @@ mod tests {
     #[test]
     fn runtime_corruption_targets_component_and_rewalks() {
         let (effects, state) = drive(
-            chain(&[C0, C1]),
+            passive(&[C0, C1]),
             &[
                 BOOT,
-                Event::PlatformMeasured(C0),
-                Event::PlatformMeasured(C1),
+                Event::VerificationPassed(C0),
+                Event::VerificationPassed(C1),
                 Event::CorruptionDetected(C1),
             ],
         );
         assert_eq!(effects.last(), Some(&Effect::RestoreGoldenImage(C1)));
         assert_eq!(state, State::Recovering);
 
-        // After Restored, re-enter MeasuringPlatform and re-walk from C0.
+        // After Restored, re-enter VerifyingPlatform and re-walk from C0.
         let (effects, state) = drive(
-            chain(&[C0, C1]),
+            passive(&[C0, C1]),
             &[
                 BOOT,
-                Event::PlatformMeasured(C0),
-                Event::PlatformMeasured(C1),
+                Event::VerificationPassed(C0),
+                Event::VerificationPassed(C1),
                 Event::CorruptionDetected(C1),
                 Event::Restored(C1),
             ],
@@ -720,9 +831,9 @@ mod tests {
         let tail = &effects[effects.len() - 2..];
         assert_eq!(
             tail,
-            &[Effect::MeasurePlatformFirmware(C0), Effect::CompareToRim(C0)],
+            &[Effect::ReadFirmware(C0), Effect::VerifyFirmware(C0)],
         );
-        assert_eq!(state, State::MeasuringPlatform);
+        assert_eq!(state, State::VerifyingPlatform);
     }
 
     /// Feedback-as-data (INV8 enforced in-core): after `MAX_RETRY` restore
@@ -730,17 +841,17 @@ mod tests {
     /// WITHOUT any external `RecoveryFailed` in the script.
     #[test]
     fn retry_cap_self_latches_via_emit() {
-        // 1-component chain; cycle Recovering <-> MeasuringPlatform via mismatch.
-        let mut script = std::vec![BOOT, Event::PlatformMeasured(C0)];
+        // 1-component chain; cycle Recovering <-> VerifyingPlatform via mismatch.
+        let mut script = std::vec![BOOT, Event::VerificationPassed(C0)];
         // Now Ready. Kick off recovery, then fail to restore MAX_RETRY times.
         script.push(Event::CorruptionDetected(C0)); // -> Recovering (retry 0)
         for _ in 0..(MAX_RETRY - 1) {
-            script.push(Event::Restored(C0)); // -> re-walk MeasuringPlatform
-            script.push(Event::PlatformMismatch(C0)); // -> Recovering again
+            script.push(Event::Restored(C0)); // -> re-walk VerifyingPlatform
+            script.push(Event::VerificationFailed(C0)); // -> Recovering again
         }
         script.push(Event::Restored(C0)); // MAX_RETRY-th -> self-emit RecoveryFailed
 
-        let (effects, state) = drive(chain(&[C0]), &script);
+        let (effects, state) = drive(passive(&[C0]), &script);
 
         // The script never contains an external RecoveryFailed...
         assert!(!script.contains(&Event::RecoveryFailed));
@@ -755,18 +866,18 @@ mod tests {
     fn custom_capacity_walks_full_chain() {
         const C2: ComponentId = ComponentId::new(2);
 
-        let mut chain = heapless::Vec::<ComponentId, 3>::new();
+        let mut c = heapless::Vec::<(ComponentId, ComponentKind), 3>::new();
         for &id in &[C0, C1, C2] {
-            chain.push(id).expect("3 fits in N=3");
+            c.push((id, ComponentKind::Passive)).expect("3 fits in N=3");
         }
 
-        let mut orch = Orchestrator::new(chain, MAX_RETRY);
+        let mut orch = Orchestrator::new(c, MAX_RETRY);
         let mut effects = Vec::new();
         for ev in [
             BOOT,
-            Event::PlatformMeasured(C0),
-            Event::PlatformMeasured(C1),
-            Event::PlatformMeasured(C2),
+            Event::VerificationPassed(C0),
+            Event::VerificationPassed(C1),
+            Event::VerificationPassed(C2),
         ] {
             orch.dispatch_with(ev, |e| effects.push(e));
         }
@@ -775,19 +886,55 @@ mod tests {
         assert_eq!(effects.last(), Some(&Effect::ReleaseReset(C2)));
     }
 
+    /// INV8 counts consecutive failures, not a lifetime total: after a full
+    /// recovery cycle reaches Ready the tally resets, so a later unrelated
+    /// corruption starts from zero and cannot prematurely latch the machine.
+    #[test]
+    fn retry_count_resets_after_successful_recovery() {
+        // max_retry = 2 so one retry succeeds, but two in a row would latch.
+        let mut c = heapless::Vec::<(ComponentId, ComponentKind), CAPACITY>::new();
+        c.push((C0, ComponentKind::Passive)).expect("fits");
+        let mut orch = Orchestrator::new(c, 2);
+        let mut effects = Vec::new();
+
+        // First episode: corrupt → restore → re-walk → Ready (retry_count resets).
+        for ev in [
+            BOOT,
+            Event::VerificationPassed(C0),  // → Ready
+            Event::CorruptionDetected(C0),  // → Recovering
+            Event::Restored(C0),            // retry_count = 1 < 2 → VerifyingPlatform
+            Event::VerificationPassed(C0),  // → Ready  (retry_count reset to 0)
+        ] {
+            orch.dispatch_with(ev, |e| effects.push(e));
+        }
+        assert_eq!(orch.state(), State::Ready);
+
+        // Second episode: corrupt again — must NOT latch despite the earlier retry.
+        let start = effects.len();
+        for ev in [
+            Event::CorruptionDetected(C0),  // → Recovering (retry_count was 0)
+            Event::Restored(C0),            // retry_count = 1 < 2 → VerifyingPlatform
+            Event::VerificationPassed(C0),  // → Ready
+        ] {
+            orch.dispatch_with(ev, |e| effects.push(e));
+        }
+        assert_eq!(orch.state(), State::Ready);
+        assert!(!effects[start..].contains(&Effect::LatchLockdown));
+    }
+
     /// A board supplies the recovery-retry cap (the core names no default). With
     /// `max_retry = 1` the FIRST failed restore self-latches to `Locked` — where
     /// a cap of 3 would instead re-walk the chain.
     #[test]
     fn custom_retry_cap_latches_sooner() {
-        let mut chain = heapless::Vec::<ComponentId, CAPACITY>::new();
-        chain.push(C0).expect("1 fits");
+        let mut c = heapless::Vec::<(ComponentId, ComponentKind), CAPACITY>::new();
+        c.push((C0, ComponentKind::Passive)).expect("1 fits");
 
-        let mut orch = Orchestrator::new(chain, 1);
+        let mut orch = Orchestrator::new(c, 1);
         let mut effects = Vec::new();
         for ev in [
             BOOT,
-            Event::PlatformMeasured(C0),
+            Event::VerificationPassed(C0),
             Event::CorruptionDetected(C0), // -> Recovering (retry 0)
             Event::Restored(C0),           // retry 1 >= 1 -> self-latch to Locked
         ] {
@@ -796,5 +943,88 @@ mod tests {
 
         assert_eq!(orch.state(), State::Locked);
         assert_eq!(effects.last(), Some(&Effect::LatchLockdown));
+    }
+
+    // ----- New invariant tests (INV10–INV13) -----
+
+    /// INV12: PowerGood(SelfVerificationFailed) latches to Locked immediately
+    /// without ever entering VerifyingPlatform.
+    #[test]
+    fn self_verification_failure_latches_immediately() {
+        let (effects, state) = drive(
+            passive(&[C0]),
+            &[Event::PowerGood(PowerOnResult::SelfVerificationFailed)],
+        );
+        assert_eq!(effects, std::vec![Effect::LatchLockdown]);
+        assert_eq!(state, State::Locked);
+    }
+
+    /// INV11: an Active component gates the chain walk — the cursor does not
+    /// advance and the next component's measurement does not begin until
+    /// ComponentReady arrives.
+    #[test]
+    fn active_component_gates_on_component_ready() {
+        // Two-component chain: C0 Active, C1 Passive.
+        let (effects, state) = drive(
+            chain(&[(C0, ComponentKind::Active), (C1, ComponentKind::Passive)]),
+            &[
+                BOOT,
+                Event::VerificationPassed(C0), // eRoT auth passes → ReleaseReset(C0), enter AwaitingReady
+                // No ComponentReady yet — machine stays in AwaitingReady.
+            ],
+        );
+        assert_eq!(state, State::AwaitingReady);
+        // Effect trace: read+verify C0 (entry), then release C0 and
+        // start reading+verifying C1 (handler emits these speculatively).
+        assert!(effects.contains(&Effect::ReleaseReset(C0)));
+        assert!(effects.contains(&Effect::ReadFirmware(C1)));
+
+        // Now deliver ComponentReady(C0) — chain walk should advance.
+        let (effects2, state2) = drive(
+            chain(&[(C0, ComponentKind::Active), (C1, ComponentKind::Passive)]),
+            &[
+                BOOT,
+                Event::VerificationPassed(C0),
+                Event::ComponentReady(C0),
+                // C1 is Passive — machine should be in VerifyingPlatform waiting for VerificationPassed(C1).
+                Event::VerificationPassed(C1),
+            ],
+        );
+        assert_eq!(state2, State::Ready);
+        assert!(effects2.contains(&Effect::ReleaseReset(C1)));
+    }
+
+    /// INV10: a ComponentReady that does not match the awaited component is
+    /// silently ignored; the walk does not advance.
+    #[test]
+    fn spurious_component_ready_is_ignored() {
+        let (effects, state) = drive(
+            chain(&[(C0, ComponentKind::Active), (C1, ComponentKind::Passive)]),
+            &[
+                BOOT,
+                Event::VerificationPassed(C0),       // → AwaitingReady(C0)
+                Event::ComponentReady(C1),          // wrong id — should be ignored
+            ],
+        );
+        // Still waiting for C0.
+        assert_eq!(state, State::AwaitingReady);
+        // C1 was not released.
+        assert!(!effects.contains(&Effect::ReleaseReset(C1)));
+    }
+
+    /// INV13: AttestationChallenge is handled in AwaitingReady exactly as in
+    /// Ready/Updating/Recovering — no state change.
+    #[test]
+    fn attestation_in_awaiting_ready() {
+        let (effects, state) = drive(
+            chain(&[(C0, ComponentKind::Active), (C1, ComponentKind::Passive)]),
+            &[
+                BOOT,
+                Event::VerificationPassed(C0),   // → AwaitingReady
+                Event::AttestationChallenge,
+            ],
+        );
+        assert_eq!(state, State::AwaitingReady);
+        assert_eq!(effects.last(), Some(&Effect::SignAttestation));
     }
 }

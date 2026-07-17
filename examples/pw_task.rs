@@ -19,7 +19,7 @@
 //! The point: the `#[entry]` task IS the shell/board layer. The pure core
 //! (`Orchestrator`) never names a syscall, a channel, or a component.
 
-use rot_reducer::{ComponentId, Effect, Event, Orchestrator, Platform, Provisioning, State};
+use rot_reducer::{ComponentId, ComponentKind, Effect, Event, Orchestrator, Platform, PowerOnResult, State};
 
 // Board policy — the only place real components are named (like the handle and
 // id constants a task hard-codes for its own wiring).
@@ -39,8 +39,8 @@ impl Platform for IpcPlatform {
         // (task, request-bytes) it would send. The opaque `ComponentId` becomes
         // a request byte the driver task decodes.
         let (task, req): (&str, [u8; 2]) = match effect {
-            Effect::MeasurePlatformFirmware(id) => ("FLASH", [0x01, id.get()]),
-            Effect::CompareToRim(id) => ("FLASH", [0x02, id.get()]),
+            Effect::ReadFirmware(id) => ("FLASH", [0x01, id.get()]),
+            Effect::VerifyFirmware(id) => ("FLASH", [0x02, id.get()]),
             Effect::ReleaseReset(id) => ("GPIO", [0x03, id.get()]),
             Effect::RestoreGoldenImage(id) => ("FLASH", [0x04, id.get()]),
             Effect::AuthenticateUpdate => ("CRYPTO", [0x10, 0]),
@@ -60,21 +60,22 @@ impl Platform for IpcPlatform {
 /// `[tag, arg]`.
 fn decode_event(bytes: &[u8]) -> Option<Event> {
     match bytes {
-        [0x00, 0x01] => Some(Event::PowerGood(Provisioning::Provisioned)),
-        [0x00, 0x00] => Some(Event::PowerGood(Provisioning::Unprovisioned)),
-        [0x01, id] => Some(Event::PlatformMeasured(ComponentId::new(*id))),
-        [0x02, id] => Some(Event::PlatformMismatch(ComponentId::new(*id))),
+        [0x00, 0x01] => Some(Event::PowerGood(PowerOnResult::Provisioned)),
+        [0x00, 0x00] => Some(Event::PowerGood(PowerOnResult::Unprovisioned)),
+        [0x01, id] => Some(Event::VerificationPassed(ComponentId::new(*id))),
+        [0x02, id] => Some(Event::VerificationFailed(ComponentId::new(*id))),
         [0x03, _] => Some(Event::AttestationChallenge),
         [0x04, id] => Some(Event::CorruptionDetected(ComponentId::new(*id))),
         [0x05, id] => Some(Event::Restored(ComponentId::new(*id))),
+        [0x06, id] => Some(Event::ComponentReady(ComponentId::new(*id))),
         _ => None,
     }
 }
 
 fn main() {
-    let mut chain = heapless::Vec::<ComponentId, CAPACITY>::new();
-    let _ = chain.push(BMC);
-    let _ = chain.push(HOST);
+    let mut chain = heapless::Vec::<(ComponentId, ComponentKind), CAPACITY>::new();
+    let _ = chain.push((BMC, ComponentKind::Active));
+    let _ = chain.push((HOST, ComponentKind::Active));
 
     // Held across the loop, so state survives from one event to the next.
     let mut orch = Orchestrator::new(chain, MAX_RETRY);
@@ -85,8 +86,10 @@ fn main() {
     // channels. Scripted here so the example runs on the host.
     let inbox: &[&[u8]] = &[
         &[0x00, 0x01], // PowerGood(Provisioned)
-        &[0x01, 0x00], // PlatformMeasured(BMC)
-        &[0x01, 0x01], // PlatformMeasured(HOST)   -> Ready
+        &[0x01, 0x00], // VerificationPassed(BMC)
+        &[0x06, 0x00], // ComponentReady(BMC)      -> advance to HOST
+        &[0x01, 0x01], // VerificationPassed(HOST)
+        &[0x06, 0x01], // ComponentReady(HOST)     -> Ready
         &[0x03, 0x00], // AttestationChallenge     -> SignAttestation
         &[0x04, 0x01], // CorruptionDetected(HOST) -> Recovering
     ];
